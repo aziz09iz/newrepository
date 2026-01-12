@@ -9,8 +9,9 @@ import pytz
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
-from dotenv import load_dotenv # Baris ini sebenernya tidak perlu jika tanpa .env, tapi amannya kita pakai os saja.
-# KITA HAPUS import dotenv karena kamu tidak mau pakai file .env lagi
+
+# --- HAPUS IMPORT DOTENV YANG BIKIN ERROR ---
+# (Baris yang bikin error sudah dihapus di versi ini)
 
 # --- KONFIGURASI ---
 # Bot akan mencari token dari settingan Railway (Environment Variable)
