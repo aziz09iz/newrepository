@@ -1,14 +1,17 @@
 import logging
 import json
 import os
-import asyncio
-from datetime import time, timedelta, datetime
+from datetime import time, datetime, timedelta
 import pytz
 
-# Library Telegram & Scheduler
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
-from telegram.error import BadRequest
+# Library Telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, 
+    ContextTypes, 
+    CommandHandler, 
+    CallbackQueryHandler
+)
 
 # --- KONFIGURASI ---
 TOKEN = os.getenv("BOT_TOKEN")
@@ -29,178 +32,252 @@ def load_alarms():
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
-def save_alarm_to_db(chat_id, time_str):
+def save_alarm_to_db(chat_id, time_str, message, alarm_type):
     alarms = load_alarms()
-    # Cek duplikat biar gak double
-    for a in alarms:
-        if a['chat_id'] == chat_id and a['time'] == time_str:
-            return
-    alarms.append({"chat_id": chat_id, "time": time_str})
+    # Hapus duplikat lama (update)
+    alarms = [a for a in alarms if not (a['chat_id'] == chat_id and a['time'] == time_str)]
+    
+    alarms.append({
+        "chat_id": chat_id, 
+        "time": time_str,
+        "message": message,
+        "type": alarm_type # 'daily', 'workdays', atau 'once'
+    })
     with open(FILE_DB, 'w') as f:
         json.dump(alarms, f, indent=4)
 
 def remove_alarm_from_db(chat_id, time_str):
     alarms = load_alarms()
-    # Filter: Ambil semua KECUALI yang mau dihapus
     new_alarms = [a for a in alarms if not (a['chat_id'] == chat_id and a['time'] == time_str)]
     with open(FILE_DB, 'w') as f:
         json.dump(new_alarms, f, indent=4)
 
-# --- FITUR BOT ---
+# --- FITUR UTAMA ---
 
 async def send_alarm_message(context: ContextTypes.DEFAULT_TYPE):
-    """Fungsi yang dipanggil saat alarm berbunyi"""
+    """Saat alarm bunyi"""
     job = context.job
     chat_id = job.data['chat_id']
-    pesan = job.data.get('message', "⏰ ALARM! Waktunya bangun/beraktivitas!")
-    
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=pesan)
-        print(f"✅ Sukses kirim alarm ke {chat_id}")
-    except Exception as e:
-        print(f"❌ Gagal kirim alarm: {e}")
+    pesan_custom = job.data.get('message', 'Waktunya aktivitas!')
+    alarm_type = job.data.get('type', 'daily')
+    time_str = job.data.get('time_str')
 
-async def set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /set HH:MM"""
-    chat_id = update.effective_chat.id
+    # Tombol Snooze & Stop
+    keyboard = [
+        [
+            InlineKeyboardButton("💤 5 Menit Lagi", callback_data="snooze"),
+            InlineKeyboardButton("✅ Matikan", callback_data="stop_snooze")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Kirim Pesan
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text=f"⏰ **ALARM!**\n\n📝 {pesan_custom}", 
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        print(f"Gagal kirim ke {chat_id}: {e}")
+
+    # KHUSUS ALARM SEKALI JALAN:
+    # Setelah bunyi, langsung hapus dari database dan job queue
+    if alarm_type == 'once':
+        remove_alarm_from_db(chat_id, time_str)
+        job.schedule_removal()
+        print(f"Alarm sekali jalan ({time_str}) milik {chat_id} telah dihapus.")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle tombol"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "stop_snooze":
+        await query.edit_message_text(text=f"✅ Alarm dimatikan.")
+        
+    elif query.data == "snooze":
+        await query.edit_message_text(text="💤 Oke, ditunda 5 menit.")
+        # Buat job sementara untuk snooze (sekali jalan)
+        context.job_queue.run_once(
+            send_alarm_message,
+            when=300, # 300 detik
+            data={
+                'chat_id': query.message.chat_id, 
+                'message': "SNOOZE: Bangun woy!",
+                'type': 'snooze', # Tipe snooze gak perlu disimpan ke DB
+                'time_str': '00:00'
+            }
+        )
+
+# Fungsi Pembuat Alarm (Core Logic)
+async def create_alarm(update, context, alarm_type):
+    chat_id = update.effective_chat.id
     try:
         if not context.args:
-            raise ValueError("Jam kosong")
+            raise ValueError("Argument kosong")
             
         time_input = context.args[0] # HH:MM
+        # Ambil pesan custom
+        custom_msg = " ".join(context.args[1:]) if len(context.args) > 1 else "Alarm!"
+
         hour, minute = map(int, time_input.split(':'))
-        
-        # Nama job unik: "12345_07:00"
         job_name = f"{chat_id}_{time_input}"
         
-        # Cek apakah sudah ada alarm yang sama di job queue
-        current_jobs = context.job_queue.get_jobs_by_name(job_name)
-        if current_jobs:
-            await update.message.reply_text(f"⚠️ Alarm {time_input} sudah ada sebelumnya.")
-            return
-
         # Simpan ke DB
-        save_alarm_to_db(chat_id, time_input)
+        save_alarm_to_db(chat_id, time_input, custom_msg, alarm_type)
         
-        # Jadwalkan
-        new_job = context.job_queue.run_daily(
-            send_alarm_message,
-            time=time(hour=hour, minute=minute, tzinfo=JAKARTA_TZ),
-            data={'chat_id': chat_id},
-            name=job_name
-        )
-        
-        # Info debug kapan trigger selanjutnya
-        next_run = new_job.next_t.astimezone(JAKARTA_TZ).strftime('%Y-%m-%d %H:%M:%S')
-        
-        await update.message.reply_text(
-            f"✅ Alarm diset jam {time_input} WIB!\n"
-            f"📅 Akan bunyi berikutnya pada: {next_run}"
-        )
-        print(f"Alarm baru diset user {chat_id} untuk {next_run}")
-        
-    except (IndexError, ValueError):
-        await update.message.reply_text("❌ Format salah. Gunakan: /set HH:MM (Contoh: /set 07:00)")
+        # Hapus job lama kalau ada (agar tidak double)
+        current_jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in current_jobs: job.schedule_removal()
 
-async def stop_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /stop HH:MM"""
-    chat_id = update.effective_chat.id
-    try:
-        time_input = context.args[0]
-        job_name = f"{chat_id}_{time_input}"
-        
-        jobs = context.job_queue.get_jobs_by_name(job_name)
-        if not jobs:
-            await update.message.reply_text(f"❌ Tidak ditemukan alarm jam {time_input}.")
-            return
+        # LOGIKA PENJADWALAN
+        if alarm_type == 'once':
+            # Hitung waktu target untuk alarm sekali jalan
+            now = datetime.now(JAKARTA_TZ)
+            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target_time <= now:
+                target_time += timedelta(days=1) # Kalau jam sudah lewat, set untuk besok
             
-        # Hapus semua job dengan nama itu (biasanya cuma 1)
-        for job in jobs:
-            job.schedule_removal()
+            context.job_queue.run_once(
+                send_alarm_message,
+                when=target_time,
+                data={'chat_id': chat_id, 'message': custom_msg, 'type': 'once', 'time_str': time_input},
+                name=job_name
+            )
+            tipe_teks = "Sekali Jalan"
+
+        else:
+            # Alarm Harian / Kerja
+            days_filter = (0, 1, 2, 3, 4) if alarm_type == 'workdays' else None # None = Setiap hari
             
-        # Hapus dari DB
-        remove_alarm_from_db(chat_id, time_input)
-        
-        await update.message.reply_text(f"🗑️ Alarm jam {time_input} berhasil dihapus/dimatikan.")
+            context.job_queue.run_daily(
+                send_alarm_message,
+                time=time(hour=hour, minute=minute, tzinfo=JAKARTA_TZ),
+                days=days_filter, 
+                data={'chat_id': chat_id, 'message': custom_msg, 'type': alarm_type, 'time_str': time_input},
+                name=job_name
+            )
+            tipe_teks = "Senin-Jumat" if alarm_type == 'workdays' else "Setiap Hari"
+
+        await update.message.reply_text(
+            f"✅ Alarm **{tipe_teks}** diset jam `{time_input}`\n📝 Pesan: {custom_msg}",
+            parse_mode='Markdown'
+        )
         
     except (IndexError, ValueError):
-        await update.message.reply_text("Gunakan: /stop HH:MM (Contoh: /stop 07:00)")
+        cmd_map = {'daily': '/set', 'workdays': '/kerja', 'once': '/sekali'}
+        await update.message.reply_text(f"❌ Format: `{cmd_map[alarm_type]} HH:MM Pesan`")
+
+# Wrapper Commands
+async def set_daily(update, context): await create_alarm(update, context, 'daily')
+async def set_workdays(update, context): await create_alarm(update, context, 'workdays')
+async def set_once(update, context): await create_alarm(update, context, 'once')
 
 async def list_alarms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /list"""
-    chat_id = update.effective_chat.id
     alarms = load_alarms()
+    my_alarms = [a for a in alarms if a['chat_id'] == update.effective_chat.id]
+    my_alarms.sort(key=lambda x: x['time'])
     
-    # Filter alarm milik user ini saja
-    user_alarms = [a['time'] for a in alarms if a['chat_id'] == chat_id]
-    user_alarms.sort() # Urutkan jam
-    
-    if not user_alarms:
-        await update.message.reply_text("📭 Kamu belum punya alarm aktif.")
+    if not my_alarms:
+        await update.message.reply_text("📭 Belum ada alarm.")
     else:
-        text = "📋 **Daftar Alarm Kamu:**\n" + "\n".join([f"- {t} WIB" for t in user_alarms])
-        await update.message.reply_text(text)
+        msg = "📋 **Daftar Alarm Kamu:**\n\n"
+        for a in my_alarms:
+            t = a.get('type', 'daily')
+            if t == 'workdays': label = "🏢 Sen-Jum"
+            elif t == 'once': label = "1️⃣ Sekali"
+            else: label = "🔁 Tiap Hari"
+            
+            msg += f"• `{a['time']}` ({label}) - {a['message']}\n"
+        await update.message.reply_text(msg, parse_mode='Markdown')
 
-async def test_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /test (Bunyi dalam 10 detik)"""
-    chat_id = update.effective_chat.id
-    await update.message.reply_text("🧪 Tes dimulai! Alarm akan bunyi dalam 10 detik...")
-    
-    context.job_queue.run_once(
-        send_alarm_message,
-        when=10, # 10 detik dari sekarang
-        data={'chat_id': chat_id, 'message': "🧪 INI TES ALARM! Bot berfungsi normal."},
-        name=f"{chat_id}_test"
-    )
+async def stop_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        time_input = context.args[0]
+        job_name = f"{update.effective_chat.id}_{time_input}"
+        jobs = context.job_queue.get_jobs_by_name(job_name)
+        
+        if jobs:
+            for job in jobs: job.schedule_removal()
+            remove_alarm_from_db(update.effective_chat.id, time_input)
+            await update.message.reply_text(f"🗑️ Alarm jam {time_input} dihapus.")
+        else:
+            await update.message.reply_text(f"❌ Tidak ketemu alarm jam {time_input}")
+    except:
+        await update.message.reply_text("Gunakan: `/stop HH:MM`", parse_mode='Markdown')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "👋 Halo! Saya Bot Alarm 2.0\n\n"
-        "**Perintah:**\n"
-        "/set HH:MM - Pasang alarm harian\n"
-        "/stop HH:MM - Hapus alarm\n"
-        "/list - Lihat daftar alarm\n"
-        "/test - Cek bot hidup (bunyi dalam 10 detik)"
+    await update.message.reply_text(
+        "👋 **Bot Alarm V5.0 (Final Pro)**\n\n"
+        "1️⃣ `/set 07:00 [Pesan]` - Tiap Hari\n"
+        "2️⃣ `/kerja 07:00 [Pesan]` - Senin-Jumat\n"
+        "3️⃣ `/sekali 15:00 [Pesan]` - Cuma Hari Ini\n"
+        "4️⃣ `/list` - Cek Jadwal\n"
+        "5️⃣ `/stop 07:00` - Hapus Alarm\n"
+        "6️⃣ `/test` - Tes Bunyi",
+        parse_mode='Markdown'
     )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def test_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Tes bunyi dalam 5 detik...")
+    context.job_queue.run_once(
+        send_alarm_message, when=5, 
+        data={'chat_id': update.effective_chat.id, 'message': "TESTING!", 'type': 'test', 'time_str': '00:00'}
+    )
 
 async def restore_alarms(application):
     alarms = load_alarms()
-    print(f"🔄 Mengembalikan {len(alarms)} alarm dari database...")
-    for alarm in alarms:
+    print(f"🔄 Restore {len(alarms)} alarm...")
+    for a in alarms:
         try:
-            chat_id = alarm['chat_id']
-            time_str = alarm['time']
-            h, m = map(int, time_str.split(':'))
+            h, m = map(int, a['time'].split(':'))
+            t = a.get('type', 'daily')
+            chat_id = a['chat_id']
+            msg = a.get('message', 'Alarm')
+            time_str = a['time']
             job_name = f"{chat_id}_{time_str}"
-            
-            application.job_queue.run_daily(
-                send_alarm_message,
-                time=time(hour=h, minute=m, tzinfo=JAKARTA_TZ),
-                data={'chat_id': chat_id},
-                name=job_name
-            )
+
+            if t == 'once':
+                # Restore alarm sekali jalan (agak tricky kalau waktu sudah lewat saat bot mati)
+                # Kita set untuk 'Next Occurrence' dari jam tersebut
+                now = datetime.now(JAKARTA_TZ)
+                target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if target <= now: target += timedelta(days=1)
+                
+                application.job_queue.run_once(
+                    send_alarm_message, when=target,
+                    data={'chat_id': chat_id, 'message': msg, 'type': t, 'time_str': time_str},
+                    name=job_name
+                )
+            else:
+                # Alarm harian/kerja
+                days_filter = (0, 1, 2, 3, 4) if t == 'workdays' else None
+                application.job_queue.run_daily(
+                    send_alarm_message,
+                    time=time(hour=h, minute=m, tzinfo=JAKARTA_TZ),
+                    days=days_filter,
+                    data={'chat_id': chat_id, 'message': msg, 'type': t, 'time_str': time_str},
+                    name=job_name
+                )
         except Exception as e:
-            print(f"Gagal restore alarm: {e}")
+            print(f"Error restore: {e}")
 
-# --- MAIN PROGRAM ---
 if __name__ == '__main__':
-    if not TOKEN:
-        print("❌ ERROR: BOT_TOKEN belum diset di Railway Variables!")
-        exit()
-
+    if not TOKEN: exit()
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('set', set_alarm))
+    application.add_handler(CommandHandler('set', set_daily))
+    application.add_handler(CommandHandler('kerja', set_workdays))
+    application.add_handler(CommandHandler('sekali', set_once)) # NEW!
     application.add_handler(CommandHandler('stop', stop_alarm))
     application.add_handler(CommandHandler('list', list_alarms))
     application.add_handler(CommandHandler('test', test_alarm))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    async def post_init(app):
-        await restore_alarms(app)
-    application.post_init = post_init
-
-    print("🚀 Bot Versi 2.0 berjalan...")
+    application.post_init = lambda app: restore_alarms(app)
+    
+    print("🚀 Bot V5.0 (Pro + Sekali Jalan) Running...")
     application.run_polling()
