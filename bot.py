@@ -150,7 +150,14 @@ async def create_alarm(update, context, alarm_type):
 
         else:
             # Alarm Harian / Kerja
-            days_filter = (0, 1, 2, 3, 4) if alarm_type == 'workdays' else None # None = Setiap hari
+            # PERBAIKAN DI SINI:
+            # Kita harus definisikan hari secara eksplisit.
+            # 0-4 = Senin-Jumat
+            # 0-6 = Senin-Minggu (Setiap Hari)
+            if alarm_type == 'workdays':
+                days_filter = (0, 1, 2, 3, 4)
+            else:
+                days_filter = (0, 1, 2, 3, 4, 5, 6) # <--- INI PERBAIKANNYA (Tidak boleh None)
             
             context.job_queue.run_daily(
                 send_alarm_message,
@@ -240,8 +247,7 @@ async def restore_alarms(application):
             job_name = f"{chat_id}_{time_str}"
 
             if t == 'once':
-                # Restore alarm sekali jalan (agak tricky kalau waktu sudah lewat saat bot mati)
-                # Kita set untuk 'Next Occurrence' dari jam tersebut
+                # Restore alarm sekali jalan
                 now = datetime.now(JAKARTA_TZ)
                 target = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if target <= now: target += timedelta(days=1)
@@ -253,7 +259,11 @@ async def restore_alarms(application):
                 )
             else:
                 # Alarm harian/kerja
-                days_filter = (0, 1, 2, 3, 4) if t == 'workdays' else None
+                if t == 'workdays':
+                    days_filter = (0, 1, 2, 3, 4)
+                else:
+                    days_filter = (0, 1, 2, 3, 4, 5, 6) # <--- PERBAIKAN JUGA DI SINI
+
                 application.job_queue.run_daily(
                     send_alarm_message,
                     time=time(hour=h, minute=m, tzinfo=JAKARTA_TZ),
@@ -271,7 +281,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('set', set_daily))
     application.add_handler(CommandHandler('kerja', set_workdays))
-    application.add_handler(CommandHandler('sekali', set_once)) # NEW!
+    application.add_handler(CommandHandler('sekali', set_once))
     application.add_handler(CommandHandler('stop', stop_alarm))
     application.add_handler(CommandHandler('list', list_alarms))
     application.add_handler(CommandHandler('test', test_alarm))
@@ -279,5 +289,5 @@ if __name__ == '__main__':
 
     application.post_init = lambda app: restore_alarms(app)
     
-    print("🚀 Bot V5.0 (Pro + Sekali Jalan) Running...")
+    print("🚀 Bot V5.1 (Fixed Days Error) Running...")
     application.run_polling()
